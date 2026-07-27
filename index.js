@@ -202,22 +202,21 @@ async function poll() {
         }
       } else {
         // went offline
+                // went offline
         if (wasOnline) {
-          // if they were in a game when they went offline, also log leaving
+          // leave game first (newer timestamp so it appears above offline)
           if (prevGameId) {
             newLogs.push({
               type: 'game',
               name,
               text: 'left a game',
-              timestamp: now
+              timestamp: now + 1
             });
           }
-
           entry.history = [
             { went_offline: now, last_location: entry.lastStatus || 'Online' },
             ...(entry.history || [])
           ].slice(0, MAX_HISTORY);
-
           newLogs.push({
             type: 'offline',
             name,
