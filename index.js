@@ -1,8 +1,8 @@
 const express = require('express');
 const fetch = require('node-fetch');
-const fs = require('fs');
-const path = require('path');
 const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -14,10 +14,14 @@ const POLL_INTERVAL_MINUTES = Number(process.env.POLL_INTERVAL_MINUTES) || 1;
 const EXTRA_USER_IDS = (process.env.EXTRA_USER_IDS || '')
   .split(',').map(id => id.trim()).filter(Boolean).map(Number);
 
-const DATA_FILE = path.join(__dirname, 'data.json');
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
 const MAX_HISTORY = 10;
 const MAX_LOGS = 150;
 
+// In-memory cache — loaded from Supabase on startup, written back on every poll
 let data = {
   lastSeen: {},
   friends: {},
@@ -26,14 +30,34 @@ let data = {
   lastPoll: null
 };
 
-if (fs.existsSync(DATA_FILE)) {
+async function loadData() {
   try {
-    data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch (e) {}
+    const { data: rows, error } = await supabase
+      .from('app_data')
+      .select('data')
+      .eq('id', 1)
+      .single();
+    if (error) throw error;
+    if (rows && rows.data && Object.keys(rows.data).length > 0) {
+      data = { ...data, ...rows.data };
+      console.log('Loaded data from Supabase');
+    } else {
+      console.log('No existing data in Supabase, starting fresh');
+    }
+  } catch (err) {
+    console.error('Failed to load data from Supabase:', err.message);
+  }
 }
 
-function saveData() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+async function saveData() {
+  try {
+    const { error } = await supabase
+      .from('app_data')
+      .upsert({ id: 1, data }, { onConflict: 'id' });
+    if (error) throw error;
+  } catch (err) {
+    console.error('Failed to save data to Supabase:', err.message);
+  }
 }
 
 async function sendDiscord(message) {
@@ -127,7 +151,6 @@ async function poll() {
     const now = Date.now();
     const newLogs = [];
 
-    // Update friends
     const friendMap = {};
     friendIds.forEach(id => {
       const uid = String(id);
@@ -140,7 +163,6 @@ async function poll() {
     });
     data.friends = friendMap;
 
-    // Update searched users
     for (const uid of Object.keys(data.searchedUsers)) {
       if (infoMap[uid]) {
         data.searchedUsers[uid].name = infoMap[uid].name;
@@ -171,65 +193,31 @@ async function poll() {
         entry.gameId = p.placeId || null;
         entry.lastStatus = p.lastLocation || 'Online';
 
-        // came online
         if (!wasOnline) {
-          newLogs.push({
-            type: 'online',
-            name,
-            text: 'got online',
-            timestamp: now
-          });
+          newLogs.push({ type: 'online', name, text: 'got online', timestamp: now });
         }
-
-        // joined a game
         if (p.placeId && p.placeId !== prevGameId) {
-          newLogs.push({
-            type: 'game',
-            name,
-            text: `joined ${p.lastLocation || 'a game'}`,
-            timestamp: now + 1
-          });
+          newLogs.push({ type: 'game', name, text: `joined ${p.lastLocation || 'a game'}`, timestamp: now + 1 });
         }
-
-        // left a game (was in a game, now no longer in one)
         if (prevGameId && !p.placeId) {
-          newLogs.push({
-            type: 'game',
-            name,
-            text: 'left a game',
-            timestamp: now + 1
-          });
+          newLogs.push({ type: 'game', name, text: 'left a game', timestamp: now + 1 });
         }
       } else {
-        // went offline
-                // went offline
         if (wasOnline) {
-          // leave game first (newer timestamp so it appears above offline)
           if (prevGameId) {
-            newLogs.push({
-              type: 'game',
-              name,
-              text: 'left a game',
-              timestamp: now + 1
-            });
+            newLogs.push({ type: 'game', name, text: 'left a game', timestamp: now + 1 });
           }
           entry.history = [
             { went_offline: now, last_location: entry.lastStatus || 'Online' },
             ...(entry.history || [])
           ].slice(0, MAX_HISTORY);
-          newLogs.push({
-            type: 'offline',
-            name,
-            text: 'went offline',
-            timestamp: now
-          });
+          newLogs.push({ type: 'offline', name, text: 'went offline', timestamp: now });
         }
         entry.currentlyOnline = false;
         entry.gameId = null;
       }
     }
 
-    // Stable order: game → online → offline for same user, then by time
     if (newLogs.length) {
       newLogs.sort((a, b) => {
         if (a.name === b.name) {
@@ -242,7 +230,7 @@ async function poll() {
     }
 
     data.lastPoll = now;
-    saveData();
+    await saveData();
 
     for (const log of newLogs) {
       const msg = `**${log.name}** ${log.text}`;
@@ -256,10 +244,6 @@ async function poll() {
   }
 }
 
-setInterval(poll, POLL_INTERVAL_MINUTES * 60 * 1000);
-poll();
-
-// ========== API ==========
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
@@ -289,9 +273,7 @@ app.post('/search', async (req, res) => {
     const searchRes = await robloxFetch(
       `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(username)}&limit=10`
     );
-    if (!searchRes.data || !searchRes.data.length) {
-      return res.json({ ok: false });
-    }
+    if (!searchRes.data || !searchRes.data.length) return res.json({ ok: false });
 
     const target = searchRes.data[0];
     const targetId = target.id;
@@ -318,12 +300,10 @@ app.post('/search', async (req, res) => {
       data.lastSeen[uid].gameId = p.placeId || null;
       data.lastSeen[uid].lastStatus = p.lastLocation || 'Online';
     } else {
-      if (data.lastSeen[uid]) {
-        data.lastSeen[uid].currentlyOnline = false;
-      }
+      if (data.lastSeen[uid]) data.lastSeen[uid].currentlyOnline = false;
     }
 
-    saveData();
+    await saveData();
     res.json({ ok: true });
   } catch (e) {
     console.error('Search failed:', e.message);
@@ -331,21 +311,27 @@ app.post('/search', async (req, res) => {
   }
 });
 
-app.post('/remove', (req, res) => {
+app.post('/remove', async (req, res) => {
   try {
     const { userId } = req.body;
     if (!userId) return res.json({ ok: false });
     const uid = String(userId);
     delete data.searchedUsers[uid];
     delete data.lastSeen[uid];
-    saveData();
+    await saveData();
     res.json({ ok: true });
   } catch (e) {
     res.json({ ok: false });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Polling every ${POLL_INTERVAL_MINUTES} minutes`);
+// Load persisted data first, then start polling and server
+loadData().then(() => {
+  setInterval(poll, POLL_INTERVAL_MINUTES * 60 * 1000);
+  poll();
+
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Polling every ${POLL_INTERVAL_MINUTES} minutes`);
+  });
 });
