@@ -171,7 +171,7 @@ async function poll() {
         entry.gameId = p.placeId || null;
         entry.lastStatus = p.lastLocation || 'Online';
 
-        // online first (older timestamp)
+        // came online
         if (!wasOnline) {
           newLogs.push({
             type: 'online',
@@ -180,7 +180,8 @@ async function poll() {
             timestamp: now
           });
         }
-        // game second (newer timestamp → appears above in newest-first list)
+
+        // joined a game
         if (p.placeId && p.placeId !== prevGameId) {
           newLogs.push({
             type: 'game',
@@ -189,12 +190,34 @@ async function poll() {
             timestamp: now + 1
           });
         }
+
+        // left a game (was in a game, now no longer in one)
+        if (prevGameId && !p.placeId) {
+          newLogs.push({
+            type: 'game',
+            name,
+            text: 'left a game',
+            timestamp: now + 1
+          });
+        }
       } else {
+        // went offline
         if (wasOnline) {
+          // if they were in a game when they went offline, also log leaving
+          if (prevGameId) {
+            newLogs.push({
+              type: 'game',
+              name,
+              text: 'left a game',
+              timestamp: now
+            });
+          }
+
           entry.history = [
             { went_offline: now, last_location: entry.lastStatus || 'Online' },
             ...(entry.history || [])
           ].slice(0, MAX_HISTORY);
+
           newLogs.push({
             type: 'offline',
             name,
@@ -203,10 +226,11 @@ async function poll() {
           });
         }
         entry.currentlyOnline = false;
+        entry.gameId = null;
       }
     }
 
-    // game → online → offline for same user, then by time
+    // Stable order: game → online → offline for same user, then by time
     if (newLogs.length) {
       newLogs.sort((a, b) => {
         if (a.name === b.name) {
