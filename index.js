@@ -171,22 +171,22 @@ async function poll() {
         entry.gameId = p.placeId || null;
         entry.lastStatus = p.lastLocation || 'Online';
 
-        // online event first (slightly earlier timestamp)
+        // online first (older timestamp)
         if (!wasOnline) {
           newLogs.push({
             type: 'online',
             name,
             text: 'got online',
-            timestamp: now - 1
+            timestamp: now
           });
         }
-        // then game event
+        // game second (newer timestamp → appears above in newest-first list)
         if (p.placeId && p.placeId !== prevGameId) {
           newLogs.push({
             type: 'game',
             name,
             text: `joined ${p.lastLocation || 'a game'}`,
-            timestamp: now
+            timestamp: now + 1
           });
         }
       } else {
@@ -206,11 +206,11 @@ async function poll() {
       }
     }
 
-    // Stable order: online → game → offline for same user, then by time
+    // game → online → offline for same user, then by time
     if (newLogs.length) {
       newLogs.sort((a, b) => {
         if (a.name === b.name) {
-          const order = { online: 0, game: 1, offline: 2 };
+          const order = { game: 0, online: 1, offline: 2 };
           return (order[a.type] ?? 9) - (order[b.type] ?? 9);
         }
         return b.timestamp - a.timestamp;
