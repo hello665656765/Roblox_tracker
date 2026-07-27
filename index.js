@@ -3,13 +3,11 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
 const ROBLOSECURITY = process.env.ROBLOSECURITY;
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || '';
 const POLL_INTERVAL_MINUTES = Number(process.env.POLL_INTERVAL_MINUTES) || 1;
@@ -114,12 +112,10 @@ async function getThumbnails(userIds) {
 async function poll() {
   try {
     console.log(`[${new Date().toISOString()}] Polling...`);
-
     const myId = await getUserId();
     const friendIds = await getFriendsIds(myId);
     const searchedIds = Object.keys(data.searchedUsers).map(Number);
     const allIds = [...new Set([...friendIds, ...searchedIds, ...EXTRA_USER_IDS])];
-
     if (!allIds.length) return;
 
     const [infoMap, pfpMap, presences] = await Promise.all([
@@ -175,11 +171,23 @@ async function poll() {
         entry.gameId = p.placeId || null;
         entry.lastStatus = p.lastLocation || 'Online';
 
+        // online event first (slightly earlier timestamp)
         if (!wasOnline) {
-          newLogs.push({ type: 'online', name, text: 'got online', timestamp: now });
+          newLogs.push({
+            type: 'online',
+            name,
+            text: 'got online',
+            timestamp: now - 1
+          });
         }
+        // then game event
         if (p.placeId && p.placeId !== prevGameId) {
-          newLogs.push({ type: 'game', name, text: `joined ${p.lastLocation || 'a game'}`, timestamp: now });
+          newLogs.push({
+            type: 'game',
+            name,
+            text: `joined ${p.lastLocation || 'a game'}`,
+            timestamp: now
+          });
         }
       } else {
         if (wasOnline) {
@@ -187,14 +195,26 @@ async function poll() {
             { went_offline: now, last_location: entry.lastStatus || 'Online' },
             ...(entry.history || [])
           ].slice(0, MAX_HISTORY);
-          newLogs.push({ type: 'offline', name, text: 'went offline', timestamp: now });
+          newLogs.push({
+            type: 'offline',
+            name,
+            text: 'went offline',
+            timestamp: now
+          });
         }
         entry.currentlyOnline = false;
       }
     }
 
-    // Save new logs (newest first)
+    // Stable order: online → game → offline for same user, then by time
     if (newLogs.length) {
+      newLogs.sort((a, b) => {
+        if (a.name === b.name) {
+          const order = { online: 0, game: 1, offline: 2 };
+          return (order[a.type] ?? 9) - (order[b.type] ?? 9);
+        }
+        return b.timestamp - a.timestamp;
+      });
       data.logs = [...newLogs, ...(data.logs || [])].slice(0, MAX_LOGS);
     }
 
@@ -246,7 +266,6 @@ app.post('/search', async (req, res) => {
     const searchRes = await robloxFetch(
       `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(username)}&limit=10`
     );
-
     if (!searchRes.data || !searchRes.data.length) {
       return res.json({ ok: false });
     }
@@ -293,11 +312,9 @@ app.post('/remove', (req, res) => {
   try {
     const { userId } = req.body;
     if (!userId) return res.json({ ok: false });
-
     const uid = String(userId);
     delete data.searchedUsers[uid];
     delete data.lastSeen[uid];
-
     saveData();
     res.json({ ok: true });
   } catch (e) {
