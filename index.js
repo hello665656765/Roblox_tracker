@@ -10,33 +10,28 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ============ CONFIG ============
 const ROBLOSECURITY = process.env.ROBLOSECURITY;
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || '';
 const POLL_INTERVAL_MINUTES = Number(process.env.POLL_INTERVAL_MINUTES) || 1;
 const EXTRA_USER_IDS = (process.env.EXTRA_USER_IDS || '')
-  .split(',')
-  .map(id => id.trim())
-  .filter(Boolean)
-  .map(Number);
-// ================================
+  .split(',').map(id => id.trim()).filter(Boolean).map(Number);
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 const MAX_HISTORY = 10;
+const MAX_LOGS = 150;
 
 let data = {
   lastSeen: {},
   friends: {},
   searchedUsers: {},
+  logs: [],
   lastPoll: null
 };
 
 if (fs.existsSync(DATA_FILE)) {
   try {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch (e) {
-    console.error('Failed to load data.json', e);
-  }
+  } catch (e) {}
 }
 
 function saveData() {
@@ -51,9 +46,7 @@ async function sendDiscord(message) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: message })
     });
-  } catch (e) {
-    console.error('Discord webhook failed', e.message);
-  }
+  } catch (e) {}
 }
 
 async function robloxFetch(url, options = {}) {
@@ -127,10 +120,7 @@ async function poll() {
     const searchedIds = Object.keys(data.searchedUsers).map(Number);
     const allIds = [...new Set([...friendIds, ...searchedIds, ...EXTRA_USER_IDS])];
 
-    if (!allIds.length) {
-      console.log('No users to track');
-      return;
-    }
+    if (!allIds.length) return;
 
     const [infoMap, pfpMap, presences] = await Promise.all([
       getUsersInfo(allIds),
@@ -141,7 +131,7 @@ async function poll() {
     const now = Date.now();
     const newLogs = [];
 
-    // Update friends map
+    // Update friends
     const friendMap = {};
     friendIds.forEach(id => {
       const uid = String(id);
@@ -154,15 +144,13 @@ async function poll() {
     });
     data.friends = friendMap;
 
-    // Keep searched users updated
+    // Update searched users
     for (const uid of Object.keys(data.searchedUsers)) {
       if (infoMap[uid]) {
         data.searchedUsers[uid].name = infoMap[uid].name;
         data.searchedUsers[uid].username = infoMap[uid].username;
       }
-      if (pfpMap[uid]) {
-        data.searchedUsers[uid].pfp = pfpMap[uid];
-      }
+      if (pfpMap[uid]) data.searchedUsers[uid].pfp = pfpMap[uid];
     }
 
     for (const p of presences) {
@@ -188,10 +176,10 @@ async function poll() {
         entry.lastStatus = p.lastLocation || 'Online';
 
         if (!wasOnline) {
-          newLogs.push({ type: 'online', name, text: 'just came online' });
+          newLogs.push({ type: 'online', name, text: 'got online', timestamp: now });
         }
         if (p.placeId && p.placeId !== prevGameId) {
-          newLogs.push({ type: 'game', name, text: `joined ${p.lastLocation || 'a game'}` });
+          newLogs.push({ type: 'game', name, text: `joined ${p.lastLocation || 'a game'}`, timestamp: now });
         }
       } else {
         if (wasOnline) {
@@ -199,10 +187,15 @@ async function poll() {
             { went_offline: now, last_location: entry.lastStatus || 'Online' },
             ...(entry.history || [])
           ].slice(0, MAX_HISTORY);
-          newLogs.push({ type: 'offline', name, text: 'went offline' });
+          newLogs.push({ type: 'offline', name, text: 'went offline', timestamp: now });
         }
         entry.currentlyOnline = false;
       }
+    }
+
+    // Save new logs (newest first)
+    if (newLogs.length) {
+      data.logs = [...newLogs, ...(data.logs || [])].slice(0, MAX_LOGS);
     }
 
     data.lastPoll = now;
@@ -214,22 +207,22 @@ async function poll() {
       await sendDiscord(msg);
     }
 
-    console.log(`Checked ${allIds.length} users | ${newLogs.length} events`);
+    console.log(`Checked ${allIds.length} users | ${newLogs.length} new logs`);
   } catch (err) {
     console.error('Poll failed:', err.message);
   }
 }
 
-// Start polling
 setInterval(poll, POLL_INTERVAL_MINUTES * 60 * 1000);
 poll();
 
-// ============ API ============
+// ========== API ==========
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
     lastPoll: data.lastPoll ? new Date(data.lastPoll).toISOString() : null,
-    trackedUsers: Object.keys(data.lastSeen).length
+    trackedUsers: Object.keys(data.lastSeen).length,
+    totalLogs: (data.logs || []).length
   });
 });
 
@@ -240,11 +233,11 @@ app.get('/data', (req, res) => {
     lastSeen: data.lastSeen,
     friends: data.friends,
     searchedUsers: data.searchedUsers,
+    logs: data.logs || [],
     lastPoll: data.lastPoll
   });
 });
 
-// Search
 app.post('/search', async (req, res) => {
   try {
     const { username } = req.body;
@@ -275,7 +268,6 @@ app.post('/search', async (req, res) => {
       pfp: pfpMap[uid] || ''
     };
 
-    // Only mark as seen if they are actually online
     const p = presences[0];
     if (p && p.userPresenceType !== 0) {
       if (!data.lastSeen[uid]) data.lastSeen[uid] = { history: [], currentlyOnline: false };
@@ -284,7 +276,6 @@ app.post('/search', async (req, res) => {
       data.lastSeen[uid].gameId = p.placeId || null;
       data.lastSeen[uid].lastStatus = p.lastLocation || 'Online';
     } else {
-      // Leave as "Never tracked"
       if (data.lastSeen[uid]) {
         data.lastSeen[uid].currentlyOnline = false;
       }
@@ -298,7 +289,6 @@ app.post('/search', async (req, res) => {
   }
 });
 
-// Remove searched user
 app.post('/remove', (req, res) => {
   try {
     const { userId } = req.body;
