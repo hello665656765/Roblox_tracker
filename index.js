@@ -10,11 +10,16 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+// ============ CONFIG ============
 const ROBLOSECURITY = process.env.ROBLOSECURITY;
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || '';
 const POLL_INTERVAL_MINUTES = Number(process.env.POLL_INTERVAL_MINUTES) || 1;
 const EXTRA_USER_IDS = (process.env.EXTRA_USER_IDS || '')
-  .split(',').map(id => id.trim()).filter(Boolean).map(Number);
+  .split(',')
+  .map(id => id.trim())
+  .filter(Boolean)
+  .map(Number);
+// ================================
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 const MAX_HISTORY = 10;
@@ -27,7 +32,11 @@ let data = {
 };
 
 if (fs.existsSync(DATA_FILE)) {
-  try { data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) {}
+  try {
+    data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  } catch (e) {
+    console.error('Failed to load data.json', e);
+  }
 }
 
 function saveData() {
@@ -42,7 +51,9 @@ async function sendDiscord(message) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: message })
     });
-  } catch (e) {}
+  } catch (e) {
+    console.error('Discord webhook failed', e.message);
+  }
 }
 
 async function robloxFetch(url, options = {}) {
@@ -116,7 +127,10 @@ async function poll() {
     const searchedIds = Object.keys(data.searchedUsers).map(Number);
     const allIds = [...new Set([...friendIds, ...searchedIds, ...EXTRA_USER_IDS])];
 
-    if (!allIds.length) return;
+    if (!allIds.length) {
+      console.log('No users to track');
+      return;
+    }
 
     const [infoMap, pfpMap, presences] = await Promise.all([
       getUsersInfo(allIds),
@@ -127,7 +141,7 @@ async function poll() {
     const now = Date.now();
     const newLogs = [];
 
-    // Update friends
+    // Update friends map
     const friendMap = {};
     friendIds.forEach(id => {
       const uid = String(id);
@@ -140,13 +154,15 @@ async function poll() {
     });
     data.friends = friendMap;
 
-    // Update searched users pfps/names too
+    // Keep searched users updated
     for (const uid of Object.keys(data.searchedUsers)) {
       if (infoMap[uid]) {
         data.searchedUsers[uid].name = infoMap[uid].name;
         data.searchedUsers[uid].username = infoMap[uid].username;
       }
-      if (pfpMap[uid]) data.searchedUsers[uid].pfp = pfpMap[uid];
+      if (pfpMap[uid]) {
+        data.searchedUsers[uid].pfp = pfpMap[uid];
+      }
     }
 
     for (const p of presences) {
@@ -193,8 +209,9 @@ async function poll() {
     saveData();
 
     for (const log of newLogs) {
-      console.log(`**${log.name}** ${log.text}`);
-      await sendDiscord(`**${log.name}** ${log.text}`);
+      const msg = `**${log.name}** ${log.text}`;
+      console.log(msg);
+      await sendDiscord(msg);
     }
 
     console.log(`Checked ${allIds.length} users | ${newLogs.length} events`);
@@ -203,10 +220,11 @@ async function poll() {
   }
 }
 
+// Start polling
 setInterval(poll, POLL_INTERVAL_MINUTES * 60 * 1000);
 poll();
 
-// ========== API ==========
+// ============ API ============
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
@@ -226,7 +244,7 @@ app.get('/data', (req, res) => {
   });
 });
 
-// Search endpoint
+// Search
 app.post('/search', async (req, res) => {
   try {
     const { username } = req.body;
@@ -257,17 +275,19 @@ app.post('/search', async (req, res) => {
       pfp: pfpMap[uid] || ''
     };
 
-    // Also update lastSeen for them immediately
+    // Only mark as seen if they are actually online
     const p = presences[0];
-    const now = Date.now();
-    if (!data.lastSeen[uid]) data.lastSeen[uid] = { history: [], currentlyOnline: false };
-
-    if (p) {
-      const isOnline = p.userPresenceType !== 0;
-      data.lastSeen[uid].currentlyOnline = isOnline;
-      data.lastSeen[uid].lastOnline = now;
+    if (p && p.userPresenceType !== 0) {
+      if (!data.lastSeen[uid]) data.lastSeen[uid] = { history: [], currentlyOnline: false };
+      data.lastSeen[uid].currentlyOnline = true;
+      data.lastSeen[uid].lastOnline = Date.now();
       data.lastSeen[uid].gameId = p.placeId || null;
-      data.lastSeen[uid].lastStatus = p.lastLocation || (isOnline ? 'Online' : 'Offline');
+      data.lastSeen[uid].lastStatus = p.lastLocation || 'Online';
+    } else {
+      // Leave as "Never tracked"
+      if (data.lastSeen[uid]) {
+        data.lastSeen[uid].currentlyOnline = false;
+      }
     }
 
     saveData();
@@ -278,6 +298,24 @@ app.post('/search', async (req, res) => {
   }
 });
 
+// Remove searched user
+app.post('/remove', (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.json({ ok: false });
+
+    const uid = String(userId);
+    delete data.searchedUsers[uid];
+    delete data.lastSeen[uid];
+
+    saveData();
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: false });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Polling every ${POLL_INTERVAL_MINUTES} minutes`);
 });
