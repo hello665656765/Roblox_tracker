@@ -6,17 +6,17 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ============ CONFIG (set these in Render Environment Variables) ============
-const ROBLOSECURITY = process.env.ROBLOSECURITY;           // your .ROBLOSECURITY cookie
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || ''; // optional
-const POLL_INTERVAL_MINUTES = Number(process.env.POLL_INTERVAL_MINUTES) || 2;
-const EXTRA_USER_IDS = (process.env.EXTRA_USER_IDS || '')  // comma-separated IDs
+// ============ CONFIG ============
+const ROBLOSECURITY = process.env.ROBLOSECURITY;
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || '';
+const POLL_INTERVAL_MINUTES = Number(process.env.POLL_INTERVAL_MINUTES) || 1;
+const EXTRA_USER_IDS = (process.env.EXTRA_USER_IDS || '')
   .split(',')
   .map(id => id.trim())
   .filter(Boolean)
   .map(Number);
 
-// ============================================================================
+// =================================
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 const MAX_HISTORY = 10;
@@ -24,10 +24,10 @@ const MAX_HISTORY = 10;
 let data = {
   lastSeen: {},
   friends: {},
-  searchedUsers: {}
+  searchedUsers: {},
+  lastPoll: null
 };
 
-// Load previous data if it exists
 if (fs.existsSync(DATA_FILE)) {
   try {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -59,17 +59,14 @@ async function robloxFetch(url, options = {}) {
     'Cookie': `.ROBLOSECURITY=${ROBLOSECURITY}`,
     ...(options.headers || {})
   };
-
   const res = await fetch(url, { ...options, headers });
-  if (!res.ok) {
-    throw new Error(`Roblox API error ${res.status} - ${url}`);
-  }
+  if (!res.ok) throw new Error(`Roblox API error ${res.status} - ${url}`);
   return res.json();
 }
 
 async function getUserId() {
-  const data = await robloxFetch('https://users.roblox.com/v1/users/authenticated');
-  return data.id;
+  const res = await robloxFetch('https://users.roblox.com/v1/users/authenticated');
+  return res.id;
 }
 
 async function getFriendsIds(userId) {
@@ -83,7 +80,6 @@ async function getUsersInfo(userIds) {
     method: 'POST',
     body: JSON.stringify({ userIds, excludeBannedUsers: false })
   });
-
   const map = {};
   (res.data || []).forEach(u => {
     map[String(u.id)] = {
@@ -124,7 +120,6 @@ async function poll() {
     const now = Date.now();
     const newLogs = [];
 
-    // Update friends map
     const friendMap = {};
     friendIds.forEach(id => {
       const uid = String(id);
@@ -136,7 +131,6 @@ async function poll() {
     });
     data.friends = friendMap;
 
-    // Process presences
     for (const p of presences) {
       const uid = String(p.userId);
       const isOnline = p.userPresenceType !== 0;
@@ -171,7 +165,6 @@ async function poll() {
             { went_offline: now, last_location: entry.lastStatus || 'Online' },
             ...(entry.history || [])
           ].slice(0, MAX_HISTORY);
-
           newLogs.push({ type: 'offline', name, text: 'went offline' });
         }
         entry.currentlyOnline = false;
@@ -181,7 +174,6 @@ async function poll() {
     data.lastPoll = now;
     saveData();
 
-    // Send notifications
     for (const log of newLogs) {
       const msg = `**${log.name}** ${log.text}`;
       console.log(msg);
@@ -196,9 +188,9 @@ async function poll() {
 
 // Start polling
 setInterval(poll, POLL_INTERVAL_MINUTES * 60 * 1000);
-poll(); // run once immediately
+poll();
 
-// Simple web server (needed for free Render plan + keep-alive)
+// ============ API for the extension ============
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
@@ -208,6 +200,16 @@ app.get('/', (req, res) => {
 });
 
 app.get('/ping', (req, res) => res.send('pong'));
+
+// This is what the extension will call
+app.get('/data', (req, res) => {
+  res.json({
+    lastSeen: data.lastSeen,
+    friends: data.friends,
+    searchedUsers: data.searchedUsers,
+    lastPoll: data.lastPoll
+  });
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
