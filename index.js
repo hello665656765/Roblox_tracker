@@ -1,7 +1,8 @@
 const express = require('express');
 const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
 const cors = require('cors');
-const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
@@ -14,14 +15,39 @@ const POLL_INTERVAL_MINUTES = Number(process.env.POLL_INTERVAL_MINUTES) || 1;
 const EXTRA_USER_IDS = (process.env.EXTRA_USER_IDS || '')
   .split(',').map(id => id.trim()).filter(Boolean).map(Number);
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
+const DATA_FILE = path.join(__dirname, 'data.json');
 const MAX_HISTORY = 10;
 const MAX_LOGS = 150;
 
-// In-memory cache — loaded from Supabase on startup, written back on every poll
+// ========== OFFLINE MILESTONES ==========
+// Base milestones up to 1 week. Beyond that, weeks just keep building up
+// (2w, 3w, 4w, ...) via getMilestonesUpTo().
+const BASE_MILESTONES = [
+  { key: '10m', ms: 10 * 60 * 1000, label: '10 minutes' },
+  { key: '30m', ms: 30 * 60 * 1000, label: '30 minutes' },
+  { key: '1h', ms: 60 * 60 * 1000, label: '1 hour' },
+  { key: '3h', ms: 3 * 60 * 60 * 1000, label: '3 hours' },
+  { key: '6h', ms: 6 * 60 * 60 * 1000, label: '6 hours' },
+  { key: '12h', ms: 12 * 60 * 60 * 1000, label: '12 hours' },
+  { key: '1d', ms: 24 * 60 * 60 * 1000, label: '1 day' },
+  { key: '3d', ms: 3 * 24 * 60 * 60 * 1000, label: '3 days' },
+  { key: '1w', ms: 7 * 24 * 60 * 60 * 1000, label: '1 week' },
+];
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Returns every milestone (base + weekly) whose threshold is <= elapsedMs,
+// sorted ascending by ms. Weekly milestones keep generating forever
+// (2w, 3w, 4w, ...) for as long as someone stays offline.
+function getMilestonesUpTo(elapsedMs) {
+  const list = [...BASE_MILESTONES];
+  let n = 2;
+  while (n * WEEK_MS <= elapsedMs) {
+    list.push({ key: `${n}w`, ms: n * WEEK_MS, label: `${n} weeks` });
+    n++;
+  }
+  return list;
+}
+
 let data = {
   lastSeen: {},
   friends: {},
@@ -30,34 +56,14 @@ let data = {
   lastPoll: null
 };
 
-async function loadData() {
+if (fs.existsSync(DATA_FILE)) {
   try {
-    const { data: rows, error } = await supabase
-      .from('app_data')
-      .select('data')
-      .eq('id', 1)
-      .single();
-    if (error) throw error;
-    if (rows && rows.data && Object.keys(rows.data).length > 0) {
-      data = { ...data, ...rows.data };
-      console.log('Loaded data from Supabase');
-    } else {
-      console.log('No existing data in Supabase, starting fresh');
-    }
-  } catch (err) {
-    console.error('Failed to load data from Supabase:', err.message);
-  }
+    data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  } catch (e) {}
 }
 
-async function saveData() {
-  try {
-    const { error } = await supabase
-      .from('app_data')
-      .upsert({ id: 1, data }, { onConflict: 'id' });
-    if (error) throw error;
-  } catch (err) {
-    console.error('Failed to save data to Supabase:', err.message);
-  }
+function saveData() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
 async function sendDiscord(message) {
@@ -151,6 +157,7 @@ async function poll() {
     const now = Date.now();
     const newLogs = [];
 
+    // Update friends
     const friendMap = {};
     friendIds.forEach(id => {
       const uid = String(id);
@@ -163,6 +170,7 @@ async function poll() {
     });
     data.friends = friendMap;
 
+    // Update searched users
     for (const uid of Object.keys(data.searchedUsers)) {
       if (infoMap[uid]) {
         data.searchedUsers[uid].name = infoMap[uid].name;
@@ -175,14 +183,13 @@ async function poll() {
       const uid = String(p.userId);
       const isOnline = p.userPresenceType !== 0;
       const name = (data.friends[uid]?.name) ||
-                   (data.searchedUsers[uid]?.name) ||
-                   (infoMap[uid]?.name) ||
-                   `User ${uid}`;
+        (data.searchedUsers[uid]?.name) ||
+        (infoMap[uid]?.name) ||
+        `User ${uid}`;
 
       if (!data.lastSeen[uid]) {
         data.lastSeen[uid] = { history: [], currentlyOnline: false };
       }
-
       const entry = data.lastSeen[uid];
       const wasOnline = entry.currentlyOnline;
       const prevGameId = entry.gameId;
@@ -192,36 +199,98 @@ async function poll() {
         entry.lastOnline = now;
         entry.gameId = p.placeId || null;
         entry.lastStatus = p.lastLocation || 'Online';
+        // coming back online clears the offline milestone clock
+        entry.offlineSince = null;
+        entry.milestonesSent = [];
 
+        // came online
         if (!wasOnline) {
-          newLogs.push({ type: 'online', name, text: 'got online', timestamp: now });
+          newLogs.push({
+            type: 'online',
+            name,
+            text: 'got online',
+            timestamp: now
+          });
         }
+
+        // joined a game
         if (p.placeId && p.placeId !== prevGameId) {
-          newLogs.push({ type: 'game', name, text: `joined ${p.lastLocation || 'a game'}`, timestamp: now + 1 });
+          newLogs.push({
+            type: 'game',
+            name,
+            text: `joined ${p.lastLocation || 'a game'}`,
+            timestamp: now + 1
+          });
         }
+
+        // left a game (was in a game, now no longer in one)
         if (prevGameId && !p.placeId) {
-          newLogs.push({ type: 'game', name, text: 'left a game', timestamp: now + 1 });
+          newLogs.push({
+            type: 'game',
+            name,
+            text: 'left a game',
+            timestamp: now + 1
+          });
         }
       } else {
+        // went offline
         if (wasOnline) {
+          // leave game first (newer timestamp so it appears above offline)
           if (prevGameId) {
-            newLogs.push({ type: 'game', name, text: 'left a game', timestamp: now + 1 });
+            newLogs.push({
+              type: 'game',
+              name,
+              text: 'left a game',
+              timestamp: now + 1
+            });
           }
+
           entry.history = [
             { went_offline: now, last_location: entry.lastStatus || 'Online' },
             ...(entry.history || [])
           ].slice(0, MAX_HISTORY);
-          newLogs.push({ type: 'offline', name, text: 'went offline', timestamp: now });
+
+          newLogs.push({
+            type: 'offline',
+            name,
+            text: 'went offline',
+            timestamp: now
+          });
+
+          // start the offline-duration milestone clock
+          entry.offlineSince = now;
+          entry.milestonesSent = [];
         }
+
         entry.currentlyOnline = false;
         entry.gameId = null;
+
+        // Check offline-duration milestones every poll, whether this is
+        // the poll they went offline on or one of many while they stay offline.
+        if (entry.offlineSince) {
+          const elapsed = now - entry.offlineSince;
+          const milestones = getMilestonesUpTo(elapsed);
+          if (!entry.milestonesSent) entry.milestonesSent = [];
+          for (const m of milestones) {
+            if (!entry.milestonesSent.includes(m.key)) {
+              entry.milestonesSent.push(m.key);
+              newLogs.push({
+                type: 'milestone',
+                name,
+                text: `has been offline for ${m.label}`,
+                timestamp: now
+              });
+            }
+          }
+        }
       }
     }
 
+    // Stable order: game → online → offline → milestone for same user, then by time
     if (newLogs.length) {
       newLogs.sort((a, b) => {
         if (a.name === b.name) {
-          const order = { game: 0, online: 1, offline: 2 };
+          const order = { game: 0, online: 1, offline: 2, milestone: 3 };
           return (order[a.type] ?? 9) - (order[b.type] ?? 9);
         }
         return b.timestamp - a.timestamp;
@@ -230,7 +299,7 @@ async function poll() {
     }
 
     data.lastPoll = now;
-    await saveData();
+    saveData();
 
     for (const log of newLogs) {
       const msg = `**${log.name}** ${log.text}`;
@@ -243,6 +312,11 @@ async function poll() {
     console.error('Poll failed:', err.message);
   }
 }
+
+setInterval(poll, POLL_INTERVAL_MINUTES * 60 * 1000);
+poll();
+
+// ========== API ==========
 
 app.get('/', (req, res) => {
   res.json({
@@ -273,7 +347,9 @@ app.post('/search', async (req, res) => {
     const searchRes = await robloxFetch(
       `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(username)}&limit=10`
     );
-    if (!searchRes.data || !searchRes.data.length) return res.json({ ok: false });
+    if (!searchRes.data || !searchRes.data.length) {
+      return res.json({ ok: false });
+    }
 
     const target = searchRes.data[0];
     const targetId = target.id;
@@ -300,10 +376,12 @@ app.post('/search', async (req, res) => {
       data.lastSeen[uid].gameId = p.placeId || null;
       data.lastSeen[uid].lastStatus = p.lastLocation || 'Online';
     } else {
-      if (data.lastSeen[uid]) data.lastSeen[uid].currentlyOnline = false;
+      if (data.lastSeen[uid]) {
+        data.lastSeen[uid].currentlyOnline = false;
+      }
     }
 
-    await saveData();
+    saveData();
     res.json({ ok: true });
   } catch (e) {
     console.error('Search failed:', e.message);
@@ -311,27 +389,21 @@ app.post('/search', async (req, res) => {
   }
 });
 
-app.post('/remove', async (req, res) => {
+app.post('/remove', (req, res) => {
   try {
     const { userId } = req.body;
     if (!userId) return res.json({ ok: false });
     const uid = String(userId);
     delete data.searchedUsers[uid];
     delete data.lastSeen[uid];
-    await saveData();
+    saveData();
     res.json({ ok: true });
   } catch (e) {
     res.json({ ok: false });
   }
 });
 
-// Load persisted data first, then start polling and server
-loadData().then(() => {
-  setInterval(poll, POLL_INTERVAL_MINUTES * 60 * 1000);
-  poll();
-
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Polling every ${POLL_INTERVAL_MINUTES} minutes`);
-  });
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Polling every ${POLL_INTERVAL_MINUTES} minutes`);
 });
