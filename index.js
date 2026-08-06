@@ -193,6 +193,7 @@ async function poll() {
       const entry = data.lastSeen[uid];
       const wasOnline = entry.currentlyOnline;
       const prevGameId = entry.gameId;
+      const prevLastStatus = entry.lastStatus; // capture before we overwrite it below
 
       if (isOnline) {
         entry.currentlyOnline = true;
@@ -216,19 +217,19 @@ async function poll() {
         // joined a game
         if (p.placeId && p.placeId !== prevGameId) {
           newLogs.push({
-            type: 'game',
+            type: 'join_game',
             name,
             text: `joined ${p.lastLocation || 'a game'}`,
             timestamp: now + 1
           });
         }
 
-        // left a game (was in a game, now no longer in one)
+        // left a game (was in a game, now no longer in one, still online)
         if (prevGameId && !p.placeId) {
           newLogs.push({
-            type: 'game',
+            type: 'leave_game',
             name,
-            text: 'left a game',
+            text: `left ${prevLastStatus || 'a game'}`,
             timestamp: now + 1
           });
         }
@@ -238,9 +239,9 @@ async function poll() {
           // leave game first (newer timestamp so it appears above offline)
           if (prevGameId) {
             newLogs.push({
-              type: 'game',
+              type: 'leave_game',
               name,
-              text: 'left a game',
+              text: `left ${entry.lastStatus || 'a game'}`,
               timestamp: now + 1
             });
           }
@@ -286,11 +287,14 @@ async function poll() {
       }
     }
 
-    // Stable order: game → online → offline → milestone for same user, then by time
+    // Stable order within the same user's batch:
+    // online -> joined game   (online shows before the game they joined)
+    // left game -> offline    (leaving the game shows before going offline)
+    // milestones last
     if (newLogs.length) {
       newLogs.sort((a, b) => {
         if (a.name === b.name) {
-          const order = { game: 0, online: 1, offline: 2, milestone: 3 };
+          const order = { online: 0, join_game: 1, leave_game: 0, offline: 1, milestone: 2 };
           return (order[a.type] ?? 9) - (order[b.type] ?? 9);
         }
         return b.timestamp - a.timestamp;
