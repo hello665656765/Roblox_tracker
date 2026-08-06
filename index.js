@@ -3,7 +3,6 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
-
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -20,8 +19,6 @@ const MAX_HISTORY = 10;
 const MAX_LOGS = 150;
 
 // ========== OFFLINE MILESTONES ==========
-// Base milestones up to 1 week. Beyond that, weeks just keep building up
-// (2w, 3w, 4w, ...) via getMilestonesUpTo().
 const BASE_MILESTONES = [
   { key: '10m', ms: 10 * 60 * 1000, label: '10 minutes' },
   { key: '30m', ms: 30 * 60 * 1000, label: '30 minutes' },
@@ -35,9 +32,6 @@ const BASE_MILESTONES = [
 ];
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
-// Returns every milestone (base + weekly) whose threshold is <= elapsedMs,
-// sorted ascending by ms. Weekly milestones keep generating forever
-// (2w, 3w, 4w, ...) for as long as someone stays offline.
 function getMilestonesUpTo(elapsedMs) {
   const list = [...BASE_MILESTONES];
   let n = 2;
@@ -60,6 +54,17 @@ if (fs.existsSync(DATA_FILE)) {
   try {
     data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
   } catch (e) {}
+}
+
+// On startup: if someone was already offline for a long time,
+// mark every milestone they already passed as "sent"
+// so the first poll doesn't spam everything.
+for (const uid of Object.keys(data.lastSeen || {})) {
+  const e = data.lastSeen[uid];
+  if (e.offlineSince && (!e.milestonesSent || e.milestonesSent.length === 0)) {
+    const elapsed = Date.now() - e.offlineSince;
+    e.milestonesSent = getMilestonesUpTo(elapsed).map(m => m.key);
+  }
 }
 
 function saveData() {
@@ -190,16 +195,18 @@ async function poll() {
       if (!data.lastSeen[uid]) {
         data.lastSeen[uid] = { history: [], currentlyOnline: false };
       }
+
       const entry = data.lastSeen[uid];
       const wasOnline = entry.currentlyOnline;
       const prevGameId = entry.gameId;
-      const prevLastStatus = entry.lastStatus; // capture before we overwrite it below
+      const prevLastStatus = entry.lastStatus;
 
       if (isOnline) {
         entry.currentlyOnline = true;
         entry.lastOnline = now;
         entry.gameId = p.placeId || null;
         entry.lastStatus = p.lastLocation || 'Online';
+
         // coming back online clears the offline milestone clock
         entry.offlineSince = null;
         entry.milestonesSent = [];
@@ -224,7 +231,7 @@ async function poll() {
           });
         }
 
-        // left a game (was in a game, now no longer in one, still online)
+        // left a game (still online)
         if (prevGameId && !p.placeId) {
           newLogs.push({
             type: 'leave_game',
@@ -236,7 +243,7 @@ async function poll() {
       } else {
         // went offline
         if (wasOnline) {
-          // leave game first (newer timestamp so it appears above offline)
+          // leave game first
           if (prevGameId) {
             newLogs.push({
               type: 'leave_game',
@@ -266,31 +273,44 @@ async function poll() {
         entry.currentlyOnline = false;
         entry.gameId = null;
 
-        // Check offline-duration milestones every poll, whether this is
-        // the poll they went offline on or one of many while they stay offline.
+        // ========== FIXED MILESTONE CHECK ==========
         if (entry.offlineSince) {
           const elapsed = now - entry.offlineSince;
           const milestones = getMilestonesUpTo(elapsed);
+
           if (!entry.milestonesSent) entry.milestonesSent = [];
+
+          // Only consider milestones that were crossed in the last poll interval
+          // (+ small buffer). This stops the "send everything at once" spam.
+          const lookback = (POLL_INTERVAL_MINUTES * 60 * 1000) + 5000;
+
+          const newlyCrossed = milestones.filter(m =>
+            !entry.milestonesSent.includes(m.key) &&
+            m.ms > elapsed - lookback
+          );
+
+          for (const m of newlyCrossed) {
+            entry.milestonesSent.push(m.key);
+            newLogs.push({
+              type: 'milestone',
+              name,
+              text: `has been offline for ${m.label}`,
+              timestamp: now
+            });
+          }
+
+          // Mark every older milestone as already sent
+          // so a future restart never dumps them.
           for (const m of milestones) {
             if (!entry.milestonesSent.includes(m.key)) {
               entry.milestonesSent.push(m.key);
-              newLogs.push({
-                type: 'milestone',
-                name,
-                text: `has been offline for ${m.label}`,
-                timestamp: now
-              });
             }
           }
         }
       }
     }
 
-    // Stable order within the same user's batch:
-    // online -> joined game   (online shows before the game they joined)
-    // left game -> offline    (leaving the game shows before going offline)
-    // milestones last
+    // Stable order within the same user's batch
     if (newLogs.length) {
       newLogs.sort((a, b) => {
         if (a.name === b.name) {
@@ -321,7 +341,6 @@ setInterval(poll, POLL_INTERVAL_MINUTES * 60 * 1000);
 poll();
 
 // ========== API ==========
-
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
