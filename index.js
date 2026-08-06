@@ -14,7 +14,7 @@ const EXTRA_USER_IDS = (process.env.EXTRA_USER_IDS || '')
 
 // ========== SUPABASE ==========
 const SUPABASE_URL = 'https://cfcoesccnarwhriuhbem.supabase.co/rest/v1';
-const SUPABASE_KEY = 'sb_secret_qfjYZ_6QPcZlm_Ldk8S24g_5s_vVcKM';
+const SUPABASE_KEY = 'sb_publishable_QJMSHNBqJ-lDhOpn_uq2VQ_L51pCvLl';
 
 const sbHeaders = {
   'apikey': SUPABASE_KEY,
