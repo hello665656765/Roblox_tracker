@@ -20,7 +20,7 @@ const sbHeaders = {
   'apikey': SUPABASE_KEY,
   'Authorization': `Bearer ${SUPABASE_KEY}`,
   'Content-Type': 'application/json',
-  'Prefer': 'return=representation'
+  'Prefer': 'resolution=merge-duplicates,return=representation'
 };
 
 async function sb(method, path, body = null) {
@@ -150,14 +150,23 @@ async function saveLastPoll(ts) {
 }
 
 async function sendDiscord(message) {
-  if (!DISCORD_WEBHOOK) return;
+  if (!DISCORD_WEBHOOK) {
+    console.log('DISCORD_WEBHOOK not set, skipping send:', message);
+    return;
+  }
   try {
-    await fetch(DISCORD_WEBHOOK, {
+    const res = await fetch(DISCORD_WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: message })
     });
-  } catch (e) {}
+    if (!res.ok) {
+      const txt = await res.text();
+      console.error(`Discord webhook failed: ${res.status} - ${txt}`);
+    }
+  } catch (e) {
+    console.error('Discord webhook fetch error:', e.message);
+  }
 }
 
 async function robloxFetch(url, options = {}) {
@@ -314,7 +323,7 @@ async function poll() {
         entry.currentlyOnline = false;
         entry.gameId = null;
 
-        // ===== FIXED MILESTONE LOGIC =====
+        // ===== MILESTONE LOGIC (fixed) =====
         if (entry.offlineSince) {
           const elapsed = now - entry.offlineSince;
           const milestones = getMilestonesUpTo(elapsed);
@@ -338,19 +347,26 @@ async function poll() {
             });
           }
 
-          // Mark older ones as sent so restarts never spam
+          // Backfill milestones that have genuinely already elapsed (e.g. after a
+          // server restart) as "sent" WITHOUT notifying — only mark ones that have
+          // actually passed, otherwise every future milestone gets pre-marked and
+          // never fires for real.
           for (const m of milestones) {
-            if (!entry.milestonesSent.includes(m.key)) {
+            if (m.ms <= elapsed && !entry.milestonesSent.includes(m.key)) {
               entry.milestonesSent.push(m.key);
             }
           }
         }
       }
 
-      // Save this user to Supabase
-      const info = data.friends[uid] || data.searchedUsers[uid] || infoMap[uid] || {};
-      const isFriend = !!data.friends[uid];
-      await saveUser(uid, entry, info, isFriend);
+      // Save this user to Supabase (don't let one bad row kill the whole poll)
+      try {
+        const info = data.friends[uid] || data.searchedUsers[uid] || infoMap[uid] || {};
+        const isFriend = !!data.friends[uid];
+        await saveUser(uid, entry, info, isFriend);
+      } catch (e) {
+        console.error(`saveUser failed for ${uid}:`, e.message);
+      }
     }
 
     if (newLogs.length) {
@@ -368,10 +384,14 @@ async function poll() {
     data.lastPoll = now;
     await saveLastPoll(now);
 
+    // Send to Discord one at a time with a small buffer, so a poll that produces
+    // several logs at once (e.g. multiple users changing state) doesn't burst
+    // the webhook and trip Discord's rate limit.
     for (const log of newLogs) {
       const msg = `**${log.name}** ${log.text}`;
       console.log(msg);
       await sendDiscord(msg);
+      await new Promise(r => setTimeout(r, 300));
     }
 
     console.log(`Checked ${allIds.length} users | ${newLogs.length} new logs`);
@@ -380,7 +400,7 @@ async function poll() {
   }
 }
 
-// ========== API (same as before) ==========
+// ========== API ==========
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
